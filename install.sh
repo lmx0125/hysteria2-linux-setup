@@ -156,7 +156,10 @@ create_hysteria_config() {
     local port="$1"
     local password="$2"
     local domain_name="$3"
+    local is_enable_tp="$4"
     local cert_dir="/usr/local/hysteria/certs"
+
+
 
     if [ ! -f /usr/local/hysteria/config.yaml ]; then
         cat > /usr/local/hysteria/config.yaml <<EOF
@@ -168,7 +171,19 @@ auth:
   type: password
   password: "${password}"
 obfs: {}
+
 EOF
+    if [ "$is_enable_tp" = "true" ]; then
+        cat >> /usr/local/hysteria/config.yaml <<EOF
+
+tcpTProxy:
+  listen: :2500
+
+udpTProxy:
+  listen: :2500
+EOF
+    fi
+
         random_color "✅ Hysteria 配置文件生成完成: /usr/local/hysteria/config.yaml"
     else
         random_color "ℹ️ 配置文件已存在，跳过生成"
@@ -285,6 +300,22 @@ cleanup() {
     exit 0
 }
 
+# ===============================
+# TProxy 配置
+# ===============================
+TProxy_configration() {
+    echo ""
+    read -r -p "$(random_color "是否启用TProxy(Y (default) /N):")" proxy < /dev/tty
+    echo ""
+
+    case "$proxy" in 
+        y|Y)
+            echo "true"
+            return
+    esac
+    echo "false"
+}
+
 
 # ===============================
 # 主程序入口
@@ -318,12 +349,13 @@ main() {
     fi
 
     download_hysteria "$arch"
+    is_enabled_TProxy=$(TProxy_configration | tr -d '\n' | tr -d '\r' | tr -d ' ')
     domain_name=$(generate_certificate)
     port=$(configure_port)
     password=$(configure_password)
 
     USE_COLOR=false
-    create_hysteria_config "$port" "$password" "$domain_name"
+    create_hysteria_config "$port" "$password" "$domain_name" "$is_enabled_TProxy"
     setup_service "$arch"
     USE_COLOR=true
 
@@ -336,6 +368,10 @@ main() {
     echo ""
     echo "节点 ： hysteria2://${password}@${IPV4}:${port}/?insecure=1&sni=www.lmx0125.icu#Hysteria2"
     echo ""
+    if [ "$is_enabled_TProxy" == "true" ];then
+    echo "TProxy 已经启用，端口为2500"
+    echo ""
+    fi
 }
 
 main
