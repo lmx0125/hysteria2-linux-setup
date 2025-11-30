@@ -13,6 +13,7 @@ This tool is designed for lightweight environments and one-click setup.
 - 📦 Supports configuration file generation  
 - 🔍 Detects public IPv4 automatically  
 - 🔒 Runs securely as a non-root service (optional)
+- 💻 TProxy auto installation
 
 ---
 
