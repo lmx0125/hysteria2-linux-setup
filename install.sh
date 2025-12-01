@@ -311,6 +311,13 @@ TProxy_configration() {
     case "$proxy" in 
         y|Y)
             echo "true"
+            # IPv4
+            ip rule add fwmark 0x1 lookup 100
+            ip route add local default dev lo table 100
+
+            # IPv6
+            ip -6 rule add fwmark 0x1 lookup 100
+            ip -6 route add local default dev lo table 100
             return
     esac
     echo "false"
