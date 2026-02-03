@@ -9,11 +9,10 @@ This tool is designed for lightweight environments and one-click setup.
 
 - 🧩 Automatically installs required dependencies  
 - ⚙️ Downloads and configures **Hysteria2**  
-- 🔁 Sets up **OpenRC** service for auto start  
+- 🔁 Sets up **OpenRC** or **Systemd** service for auto start  
 - 📦 Supports configuration file generation  
 - 🔍 Detects public IPv4 automatically  
 - 🔒 Runs securely as a non-root service (optional)
-- 💻 TProxy auto installation
 
 ---
 
