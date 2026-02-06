@@ -99,7 +99,7 @@ download_hysteria() {
 # ===============================
 generate_certificate() {
     # 将 domain_name 改为局部变量，防止被其他彩色输出污染    
-    local default_domain="www.lmx0125.icu"
+    local default_domain="dl.google.com"
     
     read -p "请输入域名 (默认 ${default_domain}): " input_domain < /dev/tty
     local domain_name=${input_domain:-$default_domain}
@@ -342,7 +342,7 @@ main() {
 
     IPV4=$(curl -s -4 ifconfig.me)
     echo ""
-    echo "节点 ： hysteria2://${password}@${IPV4}:${port}/?insecure=1&sni=www.lmx0125.icu#Hysteria2"
+    echo "节点 ： hysteria2://${password}@${IPV4}:${port}/?insecure=1&sni=${domain_name}#Hysteria2"
     echo ""
 }
 
