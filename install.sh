@@ -176,7 +176,7 @@ auth:
 masquerade:
   type: proxy
   proxy:
-    url: https://www.bing.com/
+    url: https://download.microsoft.com/
     rewriteHost: true
 
 ignoreClientBandwidth: false
