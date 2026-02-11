@@ -99,7 +99,7 @@ download_hysteria() {
 # ===============================
 generate_certificate() {
     # 将 domain_name 改为局部变量，防止被其他彩色输出污染    
-    local default_domain="dl.google.com"
+    local default_domain="download.microsoft.com"
     
     read -p "请输入域名 (默认 ${default_domain}): " input_domain < /dev/tty
     local domain_name=${input_domain:-$default_domain}
