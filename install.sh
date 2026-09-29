@@ -159,35 +159,50 @@ configure_password() {
 # ===============================
 # 系统调优（UDP 缓冲）
 # ===============================
-# 默认 net.core.rmem_max/wmem_max 只有 208KB，而 QUIC 需要 MB 级缓冲：
+# Linux 默认 net.core.rmem_max/wmem_max 只有 208KB，而 QUIC 需要 MB 级缓冲：
 # quic-go 会请求 8MB，但内核会把它静默截断到 rmem_max。在 100ms 以上 RTT
 # 的链路上 BDP 往往是几个 MB，缓冲太小会持续丢包 —— 表现为单条连接还能跑，
 # 一旦并发几条流（测速站、多线程下载）吞吐就塌到接近 0。
+#
+# 这两个值是**上限而不是预留**（空闲时基本不占内存），但小机器上仍要省着给：
+# 负载高时那个 UDP socket 真的会涨到接近上限，netdev_max_backlog 也会压住
+# 相应数量的 skb。所以按 MemTotal 分档，并只动 max（quic-go 会显式设置每个
+# socket 的缓冲，*_default 只影响其它 UDP socket，小机器上不值得放大）。
 tune_system() {
     local conf="/etc/sysctl.d/99-hysteria.conf"
-    echo -e "$(random_color '应用系统调优（UDP 缓冲）...')"
+    local mem_mb buf_max backlog
+    mem_mb=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || true)
+
+    if [ -z "${mem_mb:-}" ] || [ "$mem_mb" -lt 256 ]; then
+        # 64-255MB：给到 100Mbps × 166ms 的 BDP（约 2MB）之上的最小余量
+        buf_max=4194304; backlog=4096
+    elif [ "$mem_mb" -lt 1024 ]; then
+        buf_max=8388608; backlog=8192
+    else
+        buf_max=16777216; backlog=16384
+    fi
+
+    echo -e "$(random_color "应用系统调优（内存 ${mem_mb:-未知}MB → UDP 缓冲上限 $((buf_max / 1048576))MB）...")"
 
     cat > "$conf" <<EOF
 # Added by hysteria2-linux-setup.
-# UDP socket buffers for long-RTT / high-BDP links. Without these the kernel
-# caps them at 208KB (net.core.*mem_max) and QUIC drops packets under load.
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.core.rmem_default = 2621440
-net.core.wmem_default = 2621440
-net.core.netdev_max_backlog = 16384
+# UDP socket buffer ceiling, scaled to this machine's RAM. quic-go asks for
+# 8MB and the kernel silently caps that at net.core.*mem_max, whose 208KB
+# default makes a long-RTT connection drop packets as soon as more than one
+# flow runs. These are limits, not reservations: idle cost is zero.
+net.core.rmem_max = ${buf_max}
+net.core.wmem_max = ${buf_max}
+net.core.netdev_max_backlog = ${backlog}
 net.core.default_qdisc = fq
 EOF
 
     if command -v sysctl >/dev/null 2>&1; then
-        sysctl -w net.core.rmem_max=16777216 \
-                 net.core.wmem_max=16777216 \
-                 net.core.rmem_default=2621440 \
-                 net.core.wmem_default=2621440 \
-                 net.core.netdev_max_backlog=16384 >/dev/null 2>&1 || true
+        sysctl -w net.core.rmem_max=${buf_max} \
+                 net.core.wmem_max=${buf_max} \
+                 net.core.netdev_max_backlog=${backlog} >/dev/null 2>&1 || true
         sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
     fi
-    echo -e "$(random_color '✅ UDP 缓冲已调到 16MB（/etc/sysctl.d/99-hysteria.conf，重启后依然生效）')"
+    echo -e "$(random_color "✅ UDP 缓冲上限已设为 $((buf_max / 1048576))MB（/etc/sysctl.d/99-hysteria.conf，重启后依然生效）")"
 }
 
 # ===============================
@@ -392,7 +407,7 @@ main() {
 
     echo -e "$(random_color "🎉 Hysteria 安装与后台启动完成！")"
     echo "配置文件: /usr/local/hysteria/config.yaml"
-    echo "系统调优: /etc/sysctl.d/99-hysteria.conf（UDP 缓冲 16MB）"
+    echo "系统调优: /etc/sysctl.d/99-hysteria.conf（UDP 缓冲上限按内存自动分档）"
     echo "证书路径: /usr/local/hysteria/certs/${domain_name}.crt"
     echo "后台管理：systemctl start/stop hysteria 或 rc-service hysteria start/stop"
 
