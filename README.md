@@ -21,9 +21,10 @@ This tool is designed for lightweight environments and one-click setup.
 - **Linux VPS**
 - **Root access** (or sudo)
 - Internet connection
-- At least 64M (128M recommend) of DRAM — 64 MB is fine for the default
-  buffers, but a node serving several connections at once is happier with
-  256 MB+ (the installer scales the UDP buffers to the available RAM)
+- At least 64M (128M recommend) of DRAM — hysteria2 itself sits around 40 MB
+  RSS in practice, and the buffers are limits rather than reservations, so a
+  64 MB box is fine for one node; from 128 MB up the installer grants the full
+  16 MB UDP buffer ceiling
 
 ---
 
@@ -35,10 +36,10 @@ more than one TCP flow shares the tunnel — a multi-connection speed test reads
 ~0 while a single download is fine.
 
 - `/etc/sysctl.d/99-hysteria.conf` — UDP socket buffer ceiling, scaled to the
-  machine's RAM (4 MB below 256 MB, 8 MB below 1 GB, 16 MB above). Linux
-  defaults `net.core.rmem_max`/`wmem_max` to 208 KB, and anything QUIC asks
-  for above that is silently capped, so a long-RTT connection keeps losing
-  packets. These are limits, not reservations — idle cost is zero.
+  machine's RAM (4 MB below 64 MB, 8 MB below 128 MB, 16 MB from 128 MB up).
+  Linux defaults `net.core.rmem_max`/`wmem_max` to 208 KB, and anything QUIC
+  asks for above that is silently capped, so a long-RTT connection keeps
+  losing packets. These are limits, not reservations — idle cost is zero.
 - `congestion: {type: bbr, bbrProfile: aggressive}` in the server config —
   upstream's recommendation for high bandwidth-delay products. Switch to
   `conservative` if `aggressive` misbehaves on your line.

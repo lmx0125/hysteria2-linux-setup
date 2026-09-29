@@ -168,17 +168,22 @@ configure_password() {
 # 负载高时那个 UDP socket 真的会涨到接近上限，netdev_max_backlog 也会压住
 # 相应数量的 skb。所以按 MemTotal 分档，并只动 max（quic-go 会显式设置每个
 # socket 的缓冲，*_default 只影响其它 UDP socket，小机器上不值得放大）。
+#
+# 档位取自实测：64MB 机器上 hysteria2 常驻约 40MB，给 8MB 上限仍然有余量；
+# 128MB 起给满 16MB（100Mbps × 166ms 的 BDP 约 2MB，16MB 只是上限、不会常驻）。
 tune_system() {
     local conf="/etc/sysctl.d/99-hysteria.conf"
     local mem_mb buf_max backlog
     mem_mb=$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || true)
 
-    if [ -z "${mem_mb:-}" ] || [ "$mem_mb" -lt 256 ]; then
-        # 64-255MB：给到 100Mbps × 166ms 的 BDP（约 2MB）之上的最小余量
+    if [ -z "${mem_mb:-}" ] || [ "$mem_mb" -lt 64 ]; then
+        # <64MB 或探测不到：只给 BDP 之上的最小余量
         buf_max=4194304; backlog=4096
-    elif [ "$mem_mb" -lt 1024 ]; then
+    elif [ "$mem_mb" -lt 128 ]; then
+        # 64-127MB（实测常驻约 40MB）：8MB 上限足够
         buf_max=8388608; backlog=8192
     else
+        # >=128MB：给满 16MB
         buf_max=16777216; backlog=16384
     fi
 
