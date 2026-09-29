@@ -25,6 +25,30 @@ This tool is designed for lightweight environments and one-click setup.
 
 ---
 
+## ⚡ Performance notes
+
+The installer tunes the host for long-RTT / high-BDP links. Stock settings
+silently throttle a Hysteria2 server, which shows up as a *collapse* as soon as
+more than one TCP flow shares the tunnel — a multi-connection speed test reads
+~0 while a single download is fine.
+
+- `/etc/sysctl.d/99-hysteria.conf` — 16 MB UDP socket buffers. Linux defaults
+  `net.core.rmem_max`/`wmem_max` to 208 KB, and anything QUIC asks for above
+  that is silently capped, so a long-RTT connection keeps losing packets.
+- `congestion: {type: bbr, bbrProfile: aggressive}` in the server config —
+  upstream's recommendation for high bandwidth-delay products. Switch to
+  `conservative` if `aggressive` misbehaves on your line.
+- `quic: {init/maxStreamReceiveWindow, init/maxConnReceiveWindow}` — multi-MB
+  receive windows so a single stream is not window-limited on a 100 ms+ RTT path.
+
+How to verify after deploying: download a large file through the node with one
+connection (baseline), then start 4-8 parallel downloads of the same file. The
+parallel run should aggregate *more* than the single one, not collapse to near
+zero. To revert: delete `/etc/sysctl.d/99-hysteria.conf` and drop the
+`congestion` / `quic` blocks from `/usr/local/hysteria/config.yaml`.
+
+---
+
 ## 🧠 Overview
 
 This project includes all the main features needed to automatically deploy and manage a **Hysteria2** node on Linux.  

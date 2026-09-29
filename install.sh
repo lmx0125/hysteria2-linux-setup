@@ -157,6 +157,40 @@ configure_password() {
 }
 
 # ===============================
+# 系统调优（UDP 缓冲）
+# ===============================
+# 默认 net.core.rmem_max/wmem_max 只有 208KB，而 QUIC 需要 MB 级缓冲：
+# quic-go 会请求 8MB，但内核会把它静默截断到 rmem_max。在 100ms 以上 RTT
+# 的链路上 BDP 往往是几个 MB，缓冲太小会持续丢包 —— 表现为单条连接还能跑，
+# 一旦并发几条流（测速站、多线程下载）吞吐就塌到接近 0。
+tune_system() {
+    local conf="/etc/sysctl.d/99-hysteria.conf"
+    echo -e "$(random_color '应用系统调优（UDP 缓冲）...')"
+
+    cat > "$conf" <<EOF
+# Added by hysteria2-linux-setup.
+# UDP socket buffers for long-RTT / high-BDP links. Without these the kernel
+# caps them at 208KB (net.core.*mem_max) and QUIC drops packets under load.
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 2621440
+net.core.wmem_default = 2621440
+net.core.netdev_max_backlog = 16384
+net.core.default_qdisc = fq
+EOF
+
+    if command -v sysctl >/dev/null 2>&1; then
+        sysctl -w net.core.rmem_max=16777216 \
+                 net.core.wmem_max=16777216 \
+                 net.core.rmem_default=2621440 \
+                 net.core.wmem_default=2621440 \
+                 net.core.netdev_max_backlog=16384 >/dev/null 2>&1 || true
+        sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+    fi
+    echo -e "$(random_color '✅ UDP 缓冲已调到 16MB（/etc/sysctl.d/99-hysteria.conf，重启后依然生效）')"
+}
+
+# ===============================
 # 创建 Hysteria 配置文件
 # ===============================
 create_hysteria_config() {
@@ -185,6 +219,19 @@ masquerade:
   proxy:
     url: https://download.microsoft.com/
     rewriteHost: true
+
+# 长 RTT / 高 BDP 链路：上游默认的 standard profile 会明显跑不满，
+# aggressive 是官方对高带宽时延积链路的推荐值（跑不动可改回 conservative）。
+congestion:
+  type: bbr
+  bbrProfile: aggressive
+
+# 默认接收窗口偏小，长 RTT 下单条流就会被窗口卡住；以下是上游文档的推荐值。
+quic:
+  initStreamReceiveWindow: 8388608
+  maxStreamReceiveWindow: 8388608
+  initConnReceiveWindow: 20971520
+  maxConnReceiveWindow: 20971520
 
 ignoreClientBandwidth: false
 EOF
@@ -339,11 +386,13 @@ main() {
 
     USE_COLOR=false
     create_hysteria_config "$port" "$password" "$domain_name"
+    tune_system
     setup_service "$arch"
     USE_COLOR=true
 
     echo -e "$(random_color "🎉 Hysteria 安装与后台启动完成！")"
     echo "配置文件: /usr/local/hysteria/config.yaml"
+    echo "系统调优: /etc/sysctl.d/99-hysteria.conf（UDP 缓冲 16MB）"
     echo "证书路径: /usr/local/hysteria/certs/${domain_name}.crt"
     echo "后台管理：systemctl start/stop hysteria 或 rc-service hysteria start/stop"
 
