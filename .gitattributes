@@ -1,0 +1,5 @@
+# 确保文本文件以 LF 存储；shell 脚本始终以 LF 检出。
+# 防止 Windows 下 CRLF 行尾导致 Linux 服务器上 bash 解析报错
+# （例如 "set -euo pipefail\r" 被当成非法选项）。
+* text=auto
+*.sh text eol=lf

@@ -5,6 +5,16 @@ trap 'echo -e "\n❌ 脚本已中断，退出中..."; exit 1' INT TERM
 USE_COLOR=true
 
 # ===============================
+# 流量上报（AstraLink 面板）相关路径与常量
+# ===============================
+HY_DIR="/usr/local/hysteria"
+TRAFFIC_CONF="${HY_DIR}/traffic-report.conf"
+TRAFFIC_SCRIPT="${HY_DIR}/traffic-report.sh"
+TRAFFIC_STATE="${HY_DIR}/traffic-report.state"
+TRAFFIC_STATS_PORT="19999"
+TRAFFIC_REPORT_SERVICE="hysteria-traffic-report"
+
+# ===============================
 # 彩色输出函数
 # ===============================
 random_color() {
@@ -33,7 +43,7 @@ detect_os() {
 # 安装依赖
 # ===============================
 install_custom_packages() {
-    local pkgs=("wget" "curl" "tar" "gzip" "openssl" "jq" "lsof" "sudo")
+    local pkgs=("wget" "curl" "tar" "gzip" "openssl" "jq" "lsof" "sudo" "cron")
     echo -e "$(random_color "安装必要依赖中...")"
 
     case "$OS_TYPE" in
@@ -157,6 +167,219 @@ configure_password() {
 }
 
 # ===============================
+# 配置流量上报地址（询问部分的最后一项）
+# ===============================
+configure_traffic_report() {
+    local input
+    read -p "请输入流量上报面板地址（例如 astralink.lmx0125.top，留空则不上报）: " input < /dev/tty
+    # 去除首尾空白与末尾斜杠
+    input="${input#"${input%%[![:space:]]*}"}"
+    input="${input%"${input##*[![:space:]]}"}"
+    TRAFFIC_PANEL="${input%/}"
+    echo "$TRAFFIC_PANEL"
+}
+
+# ===============================
+# 随机密钥
+# ===============================
+random_secret() {
+    local length="${1:-24}"
+    openssl rand -hex "$length"
+}
+
+# ===============================
+# 关闭流量上报（本次填了留空时调用）
+# ===============================
+clear_traffic_report() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now "${TRAFFIC_REPORT_SERVICE}.timer" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/${TRAFFIC_REPORT_SERVICE}.service"
+        rm -f "/etc/systemd/system/${TRAFFIC_REPORT_SERVICE}.timer"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    rm -f "/etc/cron.d/${TRAFFIC_REPORT_SERVICE}"
+    if [ -f /etc/crontabs/root ]; then
+        sed -i '\#/hysteria/traffic-report.sh#d' /etc/crontabs/root 2>/dev/null || true
+    fi
+    rm -f /etc/periodic/5min/traffic-report 2>/dev/null || true
+    rm -f "$TRAFFIC_CONF" "$TRAFFIC_SCRIPT" "$TRAFFIC_STATE"
+    random_color "ℹ️ 未填写面板地址，已关闭流量上报"
+}
+
+# ===============================
+# 安装流量上报脚本与定时任务
+# ===============================
+setup_traffic_report() {
+    local panel="$1"
+    local stats_secret="$2"
+    local scheme="https"
+    local host="$panel"
+    local node_key
+    node_key=$(random_secret 24)
+
+    # 兼容直接粘贴带协议的地址
+    case "$host" in
+        http://*)  scheme="http";  host="${host#http://}" ;;
+        https://*) scheme="https"; host="${host#https://}" ;;
+    esac
+    host="${host%/}"
+
+    mkdir -p "$HY_DIR"
+
+    cat > "$TRAFFIC_CONF" <<EOF
+# AstraLink 流量上报配置（由 install.sh 生成）
+# NODE_KEY 需要填写到 AstraLink 后台对应节点的 params.report_key 中
+PANEL_SCHEME="${scheme}"
+PANEL_HOST="${host}"
+NODE_KEY="${node_key}"
+STATS_ADDR="127.0.0.1"
+STATS_PORT="${TRAFFIC_STATS_PORT}"
+STATS_SECRET="${stats_secret}"
+STATE="${TRAFFIC_STATE}"
+REPORT_PATH="/api/v1/node/report"
+EOF
+    chmod 600 "$TRAFFIC_CONF"
+
+    cat > "$TRAFFIC_SCRIPT" <<'REPORTER'
+#!/bin/bash
+# =====================================================================
+# AstraLink 节点流量上报（install.sh 生成）
+# 读取 Hysteria2 内置 trafficStats，按客户端身份计算增量后上报到面板。
+# 上报失败时保留上一次的快照，下次自动补报，不会丢流量。
+# =====================================================================
+set -uo pipefail
+
+CONF="/usr/local/hysteria/traffic-report.conf"
+[ -r "$CONF" ] || exit 0
+. "$CONF"
+
+: "${PANEL_SCHEME:=https}"
+: "${PANEL_HOST:?未配置 PANEL_HOST}"
+: "${NODE_KEY:?未配置 NODE_KEY}"
+: "${STATS_SECRET:?未配置 STATS_SECRET}"
+: "${STATS_ADDR:=127.0.0.1}"
+: "${STATS_PORT:=19999}"
+: "${STATE:=/usr/local/hysteria/traffic-report.state}"
+: "${REPORT_PATH:=/api/v1/node/report}"
+
+log() { logger -t hysteria-traffic-report "$*" 2>/dev/null || true; }
+
+# 1. 读取 Hysteria2 流量统计（不清零，靠本地快照算增量）
+current=$(curl -s -m 10 -H "Authorization: ${STATS_SECRET}" \
+    "http://${STATS_ADDR}:${STATS_PORT}/traffic" 2>/dev/null || true)
+[ -n "$current" ] || { log "读取 trafficStats 失败"; exit 0; }
+printf '%s' "$current" | jq -e . >/dev/null 2>&1 || { log "trafficStats 返回非法 JSON"; exit 0; }
+
+snapshot=$(printf '%s' "$current" | jq -c '
+    to_entries
+    | map({ key: .key, value: { tx: (.value.tx // 0), rx: (.value.rx // 0) } })
+    | from_entries' 2>/dev/null) || snapshot="{}"
+[ -n "$snapshot" ] || snapshot="{}"
+
+previous="{}"
+[ -s "$STATE" ] && previous=$(cat "$STATE" 2>/dev/null || echo "{}")
+printf '%s' "$previous" | jq -e . >/dev/null 2>&1 || previous="{}"
+
+# 2. 计算增量；计数器小于快照说明进程重启过，该身份本次跳过
+delta=$(jq -cn --argjson cur "$snapshot" --argjson prev "$previous" '
+    ($prev // {}) as $p
+    | [ ($cur | to_entries[])
+        | .key as $id
+        | (.value.tx // 0) as $tx
+        | (.value.rx // 0) as $rx
+        | ($p[$id].tx // 0) as $ptx
+        | ($p[$id].rx // 0) as $prx
+        | select($tx >= $ptx and $rx >= $prx)
+        | { key: $id, value: { tx: ($tx - $ptx), rx: ($rx - $prx) } } ]
+    | map(select(.value.tx > 0 or .value.rx > 0))
+    | from_entries
+    | { traffic: . }' 2>/dev/null) || delta='{"traffic":{}}'
+[ -n "$delta" ] || delta='{"traffic":{}}'
+
+# 3. 没有增量时只刷新快照
+if [ "$delta" = '{"traffic":{}}' ]; then
+    printf '%s\n' "$snapshot" > "$STATE"
+    exit 0
+fi
+
+# 4. 上报成功后才落盘快照，失败则下次补报
+code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 -X POST \
+    -H "Content-Type: application/json" \
+    -H "X-Node-Key: ${NODE_KEY}" \
+    -d "$delta" \
+    "${PANEL_SCHEME}://${PANEL_HOST}${REPORT_PATH}" 2>/dev/null || echo "000")
+
+case "$code" in
+    200|204)
+        printf '%s\n' "$snapshot" > "$STATE"
+        log "上报成功"
+        ;;
+    *)
+        log "上报失败（HTTP ${code}），保留快照下次补报"
+        ;;
+esac
+REPORTER
+    chmod +x "$TRAFFIC_SCRIPT"
+
+    # 定时任务：优先 systemd timer，其次 cron
+    if command -v systemctl >/dev/null 2>&1; then
+        cat > "/etc/systemd/system/${TRAFFIC_REPORT_SERVICE}.service" <<EOF
+[Unit]
+Description=AstraLink Hysteria2 Traffic Report
+After=network-online.target hysteria.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${TRAFFIC_SCRIPT}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        cat > "/etc/systemd/system/${TRAFFIC_REPORT_SERVICE}.timer" <<EOF
+[Unit]
+Description=Run AstraLink Hysteria2 traffic report every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+        systemctl daemon-reload || true
+        systemctl enable --now "${TRAFFIC_REPORT_SERVICE}.timer" >/dev/null 2>&1 || true
+        random_color "✅ 已创建流量上报定时任务（systemd timer，每 5 分钟）"
+    else
+        local cron_line=""
+        if [ -d /etc/periodic ]; then
+            # Alpine：busybox cron 读取 /etc/crontabs/root
+            mkdir -p /etc/crontabs /etc/periodic/5min
+            local entry="*/5 * * * * ${TRAFFIC_SCRIPT}"
+            if [ -f /etc/crontabs/root ]; then
+                sed -i '\#/hysteria/traffic-report.sh#d' /etc/crontabs/root 2>/dev/null || true
+            fi
+            printf '%s\n' "$entry" >> /etc/crontabs/root
+            cp "$TRAFFIC_SCRIPT" /etc/periodic/5min/traffic-report
+            chmod +x /etc/periodic/5min/traffic-report
+            cron_line="$entry"
+            rc-service crond start >/dev/null 2>&1 || true
+            rc-update add crond default >/dev/null 2>&1 || true
+        else
+            printf '*/5 * * * * root %s\n' "$TRAFFIC_SCRIPT" > "/etc/cron.d/${TRAFFIC_REPORT_SERVICE}"
+            chmod 644 "/etc/cron.d/${TRAFFIC_REPORT_SERVICE}"
+            cron_line="*/5 * * * * root ${TRAFFIC_SCRIPT}"
+            service cron start >/dev/null 2>&1 || service crond start >/dev/null 2>&1 || true
+        fi
+        random_color "✅ 已创建流量上报定时任务（cron：${cron_line}）"
+    fi
+
+    random_color "✅ 流量上报已开启"
+}
+
+# ===============================
 # 系统调优（UDP 缓冲）
 # ===============================
 # Linux 默认 net.core.rmem_max/wmem_max 只有 208KB，而 QUIC 需要 MB 级缓冲：
@@ -217,6 +440,7 @@ create_hysteria_config() {
     local port="$1"
     local password="$2"
     local domain_name="$3"
+    local stats_secret="${4:-}"
     local cert_dir="/usr/local/hysteria/certs"
 
     mkdir -p /usr/local/hysteria
@@ -256,6 +480,17 @@ quic:
 ignoreClientBandwidth: false
 EOF
     random_color "✅ Hysteria 2 配置文件已更新: /usr/local/hysteria/config.yaml"
+
+    # 需要流量上报时，追加 Hysteria2 内置流量统计服务（仅监听本机）
+    if [ -n "$stats_secret" ]; then
+        cat >> /usr/local/hysteria/config.yaml <<EOF
+
+trafficStats:
+  listen: 127.0.0.1:${TRAFFIC_STATS_PORT}
+  secret: "${stats_secret}"
+EOF
+        random_color "✅ 已开启流量统计（trafficStats: 127.0.0.1:${TRAFFIC_STATS_PORT}）"
+    fi
 }
 
 # ===============================
@@ -403,11 +638,21 @@ main() {
     domain_name=$(generate_certificate)
     port=$(configure_port)
     password=$(configure_password)
+    traffic_panel=$(configure_traffic_report)
+
+    stats_secret=""
+    [ -n "$traffic_panel" ] && stats_secret=$(random_secret 24)
 
     USE_COLOR=false
-    create_hysteria_config "$port" "$password" "$domain_name"
+    create_hysteria_config "$port" "$password" "$domain_name" "$stats_secret"
     tune_system
     setup_service "$arch"
+
+    if [ -n "$traffic_panel" ]; then
+        setup_traffic_report "$traffic_panel" "$stats_secret"
+    else
+        clear_traffic_report
+    fi
     USE_COLOR=true
 
     echo -e "$(random_color "🎉 Hysteria 安装与后台启动完成！")"
@@ -420,6 +665,18 @@ main() {
     echo ""
     echo "节点 ： hysteria2://${password}@${IPV4}:${port}/?insecure=1&sni=${domain_name}#Hysteria2"
     echo ""
+
+    if [ -n "$traffic_panel" ]; then
+        node_key=$(grep -m1 '^NODE_KEY=' "$TRAFFIC_CONF" 2>/dev/null | cut -d'"' -f2 || true)
+        echo "----------------------------------------"
+        echo "流量上报：已开启（面板 ${traffic_panel}）"
+        echo "上报脚本：${TRAFFIC_SCRIPT}（每 5 分钟执行一次，失败自动补报）"
+        echo "NODE_KEY：${node_key}"
+        echo "请把该 NODE_KEY 填到 AstraLink 后台对应节点的 params.report_key 中，"
+        echo "面板即可按上报的身份累计每个用户的流量；若面板尚未接入上报接口，"
+        echo "节点可先手动执行一次确认联通：bash ${TRAFFIC_SCRIPT}"
+        echo "----------------------------------------"
+    fi
 }
 
 main
