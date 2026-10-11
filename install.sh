@@ -219,19 +219,11 @@ clear_traffic_report() {
 # 安装流量上报脚本与定时任务
 # ===============================
 setup_traffic_report() {
-    local panel="$1"
-    local stats_secret="$2"
-    local scheme="https"
-    local host="$panel"
-    local node_key
-    node_key=$(random_secret 24)
-
-    # 兼容直接粘贴带协议的地址
-    case "$host" in
-        http://*)  scheme="http";  host="${host#http://}" ;;
-        https://*) scheme="https"; host="${host#https://}" ;;
-    esac
-    host="${host%/}"
+    local scheme="$1"      # 面板协议（http / https）
+    local host="$2"        # 面板域名（不带协议与斜杠）
+    local node_key="$3"    # 节点密钥，需填到面板节点的 params.report_key
+    local stats_secret="$4"
+    local auth_url="${scheme}://${host}/api/v1/node/hysteria2/auth/${node_key}"
 
     mkdir -p "$HY_DIR"
 
@@ -465,11 +457,25 @@ create_hysteria_config() {
     local password="$2"
     local domain_name="$3"
     local stats_secret="${4:-}"
+    local auth_url="${5:-}"   # 面板托管认证地址；为空表示仍用单密码认证
     local cert_dir="/usr/local/hysteria/certs"
 
     mkdir -p /usr/local/hysteria
     
     [ -f /usr/local/hysteria/config.yaml ] && mv /usr/local/hysteria/config.yaml /usr/local/hysteria/config.yaml.bak
+
+    # 填了面板地址就把认证交给面板：客户端每次连接都由面板判定有效性，
+    # 面板返回的 id（用户 UUID）同时就是流量统计的身份，上报时才能算到人头上。
+    local auth_block
+    if [ -n "$auth_url" ]; then
+        auth_block="  type: http
+  http:
+    url: ${auth_url}
+    insecure: false"
+    else
+        auth_block="  type: password
+  password: \"${password}\""
+    fi
 
     cat > /usr/local/hysteria/config.yaml <<EOF
 listen: :${port}
@@ -479,8 +485,7 @@ tls:
   key: ${cert_dir}/${domain_name}.key
 
 auth:
-  type: password
-  password: "${password}"
+${auth_block}
 
 masquerade:
   type: proxy
@@ -665,15 +670,31 @@ main() {
     traffic_panel=$(configure_traffic_report)
 
     stats_secret=""
-    [ -n "$traffic_panel" ] && stats_secret=$(random_secret 24)
+    node_key=""
+    panel_scheme="https"
+    panel_host="$traffic_panel"
+    if [ -n "$traffic_panel" ]; then
+        stats_secret=$(random_secret 24)
+        node_key=$(random_secret 24)
+        # 兼容直接粘贴带协议的地址
+        case "$panel_host" in
+            http://*)  panel_scheme="http";  panel_host="${panel_host#http://}" ;;
+            https://*) panel_scheme="https"; panel_host="${panel_host#https://}" ;;
+        esac
+        panel_host="${panel_host%/}"
+    fi
+
+    # 填了面板就改由面板托管认证（按用户 UUID 判定），否则保持单密码
+    auth_url=""
+    [ -n "$node_key" ] && auth_url="${panel_scheme}://${panel_host}/api/v1/node/hysteria2/auth/${node_key}"
 
     USE_COLOR=false
-    create_hysteria_config "$port" "$password" "$domain_name" "$stats_secret"
+    create_hysteria_config "$port" "$password" "$domain_name" "$stats_secret" "$auth_url"
     tune_system
     setup_service "$arch"
 
     if [ -n "$traffic_panel" ]; then
-        setup_traffic_report "$traffic_panel" "$stats_secret"
+        setup_traffic_report "$panel_scheme" "$panel_host" "$node_key" "$stats_secret"
     else
         clear_traffic_report
     fi
@@ -687,19 +708,30 @@ main() {
 
     IPV4=$(curl -s -4 ifconfig.me)
     echo ""
-    echo "节点 ： hysteria2://${password}@${IPV4}:${port}/?insecure=1&sni=${domain_name}#Hysteria2"
+    if [ -n "$traffic_panel" ]; then
+        echo "该节点已改为「面板托管认证」，分享链接由面板按用户生成："
+        echo "  格式：hysteria2://<用户UUID>@${IPV4}:${port}/?insecure=1&sni=${domain_name}#Hysteria2"
+        echo "  （每个用户在 AstraLink 里拿到属于自己的 UUID 链接，互不影响）"
+    else
+        echo "节点 ： hysteria2://${password}@${IPV4}:${port}/?insecure=1&sni=${domain_name}#Hysteria2"
+    fi
     echo ""
 
     if [ -n "$traffic_panel" ]; then
         node_key=$(grep -m1 '^NODE_KEY=' "$TRAFFIC_CONF" 2>/dev/null | cut -d'"' -f2 || true)
         echo "----------------------------------------"
-        echo "流量上报：已开启（面板 ${traffic_panel}）"
+        echo "流量上报与托管认证：已开启（面板 ${panel_scheme}://${panel_host}）"
+        echo "认证回调地址：${auth_url}"
         echo "上报脚本：${TRAFFIC_SCRIPT}（每 ${TRAFFIC_INTERVAL} 秒一次，失败自动补报）"
         echo "服务管理：systemctl status hysteria-traffic-report 或 rc-service hysteria-traffic-report status"
         echo "NODE_KEY：${node_key}"
-        echo "请把该 NODE_KEY 填到 AstraLink 后台对应节点的 params.report_key 中，"
-        echo "面板即可按上报的身份累计每个用户的流量；若面板尚未接入上报接口，"
-        echo "节点可先手动执行一次确认联通：bash ${TRAFFIC_SCRIPT}"
+        echo ""
+        echo "还需两步面板侧配置，否则没人能连上："
+        echo "  1) AstraLink 后台 → 节点管理 → 编辑本节点 → 「流量上报密钥」填上面的 NODE_KEY"
+        echo "  2) 同一表单打开「面板托管认证」开关"
+        echo "之后订阅里下发的就是 hysteria2://<用户UUID>@... 形式的链接，"
+        echo "面板按上报的身份把流量累计到每个用户头上。"
+        echo "验证联通：curl -s -X POST -d '{\"addr\":\"1.2.3.4:1\",\"auth\":\"测\",\"tx\":0}' '${auth_url}'"
         echo "----------------------------------------"
     fi
 }
