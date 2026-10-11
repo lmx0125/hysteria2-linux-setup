@@ -10,8 +10,10 @@ USE_COLOR=true
 HY_DIR="/usr/local/hysteria"
 TRAFFIC_CONF="${HY_DIR}/traffic-report.conf"
 TRAFFIC_SCRIPT="${HY_DIR}/traffic-report.sh"
+TRAFFIC_LOOP="${HY_DIR}/traffic-report-loop.sh"
 TRAFFIC_STATE="${HY_DIR}/traffic-report.state"
 TRAFFIC_STATS_PORT="19999"
+TRAFFIC_INTERVAL="300"
 TRAFFIC_REPORT_SERVICE="hysteria-traffic-report"
 
 # ===============================
@@ -43,7 +45,7 @@ detect_os() {
 # 安装依赖
 # ===============================
 install_custom_packages() {
-    local pkgs=("wget" "curl" "tar" "gzip" "openssl" "jq" "lsof" "sudo" "cron")
+    local pkgs=("wget" "curl" "tar" "gzip" "openssl" "jq" "lsof" "sudo")
     echo -e "$(random_color "安装必要依赖中...")"
 
     case "$OS_TYPE" in
@@ -192,17 +194,24 @@ random_secret() {
 # ===============================
 clear_traffic_report() {
     if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now "${TRAFFIC_REPORT_SERVICE}" >/dev/null 2>&1 || true
+        # 兼容旧版本遗留的 timer 单元
         systemctl disable --now "${TRAFFIC_REPORT_SERVICE}.timer" >/dev/null 2>&1 || true
         rm -f "/etc/systemd/system/${TRAFFIC_REPORT_SERVICE}.service"
         rm -f "/etc/systemd/system/${TRAFFIC_REPORT_SERVICE}.timer"
         systemctl daemon-reload >/dev/null 2>&1 || true
     fi
-    rm -f "/etc/cron.d/${TRAFFIC_REPORT_SERVICE}"
-    if [ -f /etc/crontabs/root ]; then
-        sed -i '\#/hysteria/traffic-report.sh#d' /etc/crontabs/root 2>/dev/null || true
+    if command -v rc-update >/dev/null 2>&1; then
+        rc-service "${TRAFFIC_REPORT_SERVICE}" stop >/dev/null 2>&1 || true
+        rc-update del "${TRAFFIC_REPORT_SERVICE}" default >/dev/null 2>&1 || true
     fi
-    rm -f /etc/periodic/5min/traffic-report 2>/dev/null || true
-    rm -f "$TRAFFIC_CONF" "$TRAFFIC_SCRIPT" "$TRAFFIC_STATE"
+    rm -f "/etc/init.d/${TRAFFIC_REPORT_SERVICE}"
+    # 兼容旧版本遗留的 cron 条目
+    rm -f "/etc/cron.d/${TRAFFIC_REPORT_SERVICE}" /etc/periodic/5min/traffic-report
+    if [ -f /etc/crontabs/root ]; then
+        sed -i '\#/hysteria/traffic-report#d' /etc/crontabs/root 2>/dev/null || true
+    fi
+    rm -f "$TRAFFIC_CONF" "$TRAFFIC_SCRIPT" "$TRAFFIC_LOOP" "$TRAFFIC_STATE"
     random_color "ℹ️ 未填写面板地址，已关闭流量上报"
 }
 
@@ -237,6 +246,7 @@ STATS_PORT="${TRAFFIC_STATS_PORT}"
 STATS_SECRET="${stats_secret}"
 STATE="${TRAFFIC_STATE}"
 REPORT_PATH="/api/v1/node/report"
+REPORT_INTERVAL="${TRAFFIC_INTERVAL}"
 EOF
     chmod 600 "$TRAFFIC_CONF"
 
@@ -321,7 +331,30 @@ esac
 REPORTER
     chmod +x "$TRAFFIC_SCRIPT"
 
-    # 定时任务：优先 systemd timer，其次 cron
+    # 守护循环：不依赖 cron（Alpine 仓库里没有 cron/cronie 这类通用包名），
+    # 一个常驻进程按 interval 反复执行上报，崩溃由 systemd/OpenRC 拉活。
+    cat > "$TRAFFIC_LOOP" <<'LOOP'
+#!/bin/bash
+# =====================================================================
+# AstraLink 流量上报守护循环（install.sh 生成）
+# 反复调用 traffic-report.sh，真正的上报逻辑在那里。
+# =====================================================================
+set -uo pipefail
+
+CONF="/usr/local/hysteria/traffic-report.conf"
+[ -r "$CONF" ] || exit 0
+. "$CONF"
+
+INTERVAL="${REPORT_INTERVAL:-300}"
+
+trap 'exit 0' TERM INT
+while true; do
+    /usr/local/hysteria/traffic-report.sh || true
+    sleep "$INTERVAL"
+done
+LOOP
+    chmod +x "$TRAFFIC_LOOP"
+
     if command -v systemctl >/dev/null 2>&1; then
         cat > "/etc/systemd/system/${TRAFFIC_REPORT_SERVICE}.service" <<EOF
 [Unit]
@@ -330,50 +363,41 @@ After=network-online.target hysteria.service
 Wants=network-online.target
 
 [Service]
-Type=oneshot
-ExecStart=${TRAFFIC_SCRIPT}
+Type=simple
+ExecStart=${TRAFFIC_LOOP}
+Restart=always
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
 EOF
-        cat > "/etc/systemd/system/${TRAFFIC_REPORT_SERVICE}.timer" <<EOF
-[Unit]
-Description=Run AstraLink Hysteria2 traffic report every 5 minutes
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
-AccuracySec=30s
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
         systemctl daemon-reload || true
-        systemctl enable --now "${TRAFFIC_REPORT_SERVICE}.timer" >/dev/null 2>&1 || true
-        random_color "✅ 已创建流量上报定时任务（systemd timer，每 5 分钟）"
+        systemctl enable --now "${TRAFFIC_REPORT_SERVICE}" >/dev/null 2>&1 || true
+        random_color "✅ 已创建流量上报服务（systemd，每 ${TRAFFIC_INTERVAL} 秒一次）"
+    elif command -v rc-update >/dev/null 2>&1; then
+        cat > "/etc/init.d/${TRAFFIC_REPORT_SERVICE}" <<EOF
+#!/sbin/openrc-run
+
+command="${TRAFFIC_LOOP}"
+pidfile="/run/${TRAFFIC_REPORT_SERVICE}.pid"
+name="${TRAFFIC_REPORT_SERVICE}"
+
+depend() {
+    need net
+    after hysteria
+}
+
+supervisor="supervise-daemon"
+respawn_delay=10
+respawn_max=0
+respawn_reason="exit signal crash"
+EOF
+        chmod +x "/etc/init.d/${TRAFFIC_REPORT_SERVICE}"
+        rc-update add "${TRAFFIC_REPORT_SERVICE}" default >/dev/null 2>&1 || true
+        rc-service "${TRAFFIC_REPORT_SERVICE}" start >/dev/null 2>&1 || true
+        random_color "✅ 已创建流量上报服务（OpenRC，每 ${TRAFFIC_INTERVAL} 秒一次）"
     else
-        local cron_line=""
-        if [ -d /etc/periodic ]; then
-            # Alpine：busybox cron 读取 /etc/crontabs/root
-            mkdir -p /etc/crontabs /etc/periodic/5min
-            local entry="*/5 * * * * ${TRAFFIC_SCRIPT}"
-            if [ -f /etc/crontabs/root ]; then
-                sed -i '\#/hysteria/traffic-report.sh#d' /etc/crontabs/root 2>/dev/null || true
-            fi
-            printf '%s\n' "$entry" >> /etc/crontabs/root
-            cp "$TRAFFIC_SCRIPT" /etc/periodic/5min/traffic-report
-            chmod +x /etc/periodic/5min/traffic-report
-            cron_line="$entry"
-            rc-service crond start >/dev/null 2>&1 || true
-            rc-update add crond default >/dev/null 2>&1 || true
-        else
-            printf '*/5 * * * * root %s\n' "$TRAFFIC_SCRIPT" > "/etc/cron.d/${TRAFFIC_REPORT_SERVICE}"
-            chmod 644 "/etc/cron.d/${TRAFFIC_REPORT_SERVICE}"
-            cron_line="*/5 * * * * root ${TRAFFIC_SCRIPT}"
-            service cron start >/dev/null 2>&1 || service crond start >/dev/null 2>&1 || true
-        fi
-        random_color "✅ 已创建流量上报定时任务（cron：${cron_line}）"
+        random_color "⚠️ 未检测到 systemd/OpenRC，请自行后台运行：nohup ${TRAFFIC_LOOP} &"
     fi
 
     random_color "✅ 流量上报已开启"
@@ -670,7 +694,8 @@ main() {
         node_key=$(grep -m1 '^NODE_KEY=' "$TRAFFIC_CONF" 2>/dev/null | cut -d'"' -f2 || true)
         echo "----------------------------------------"
         echo "流量上报：已开启（面板 ${traffic_panel}）"
-        echo "上报脚本：${TRAFFIC_SCRIPT}（每 5 分钟执行一次，失败自动补报）"
+        echo "上报脚本：${TRAFFIC_SCRIPT}（每 ${TRAFFIC_INTERVAL} 秒一次，失败自动补报）"
+        echo "服务管理：systemctl status hysteria-traffic-report 或 rc-service hysteria-traffic-report status"
         echo "NODE_KEY：${node_key}"
         echo "请把该 NODE_KEY 填到 AstraLink 后台对应节点的 params.report_key 中，"
         echo "面板即可按上报的身份累计每个用户的流量；若面板尚未接入上报接口，"
