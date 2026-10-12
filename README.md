@@ -55,25 +55,27 @@ zero. To revert: delete `/etc/sysctl.d/99-hysteria.conf` and drop the
 
 ---
 
-## 🔗 AstraLink 一键导入链接
+## 🔗 AstraLink import link
 
-安装时「流量上报面板地址」填了 AstraLink 面板（例如 `astralink.lmx0125.top`）的话，
-脚本除了开启流量上报与面板托管认证，还会在最后打印**一条可直接导入的分享链接**：
+If you entered an AstraLink panel address (e.g. `astralink.lmx0125.top`) when the installer asked for
+the traffic-reporting endpoint, the script also turns on traffic reporting and panel-managed auth —
+and prints **a single share link you can import as-is** once it finishes:
 
 ```
-hysteria2://<密码>@<公网IP>:<端口>/?insecure=1&sni=<域名>&rk=<上报密钥>&pa=1#Hysteria2-<域名>
+hysteria2://<password>@<public-ip>:<port>/?insecure=1&sni=<domain>&rk=<report-key>&pa=1#Hysteria2-<domain>
 ```
 
-把这一整行复制到 AstraLink 后台 **节点管理 → 新建节点 → 分享链接**，点「创建节点」就行：
-协议 / 地址 / 端口 / 参数会自动解析，`rk=`（流量上报密钥）与 `pa=1`（面板托管认证）也会
-一并填好 —— 不用再手工复制 `NODE_KEY`，也不用记得去打开托管认证开关。
-同一份内容还会写到节点的 `/usr/local/hysteria/astralink-node.txt`（权限 600），
-安装输出滚屏之后（或重装、换机器时）可以 `cat` 出来再导入。
+Paste that whole line into AstraLink → **Nodes → New node → Share link** and create the node:
+the protocol, address, port and parameters are parsed from the link, and `rk=` (the traffic-report
+key) plus `pa=1` (panel-managed auth) are filled in as well — no copying `NODE_KEY` by hand, no
+remembering to flip the auth switch. The same string is written to
+`/usr/local/hysteria/astralink-node.txt` (mode 600) on the node, so you can `cat` it later if the
+install output has scrolled away, or when reinstalling or moving to another machine.
 
-- `rk` / `pa` 是 AstraLink 专有查询参数，其它客户端（Hiddify / sing-box / Clash）会忽略它们，
-  所以这条链接同时仍是一条能直接用的 hysteria2 分享链接。
-- 不开流量上报（面板地址留空）时打印的是同一条链接，只是不带 `rk` / `pa`，
-  就是一条普通 hysteria2 分享链接，粘贴导入的老流程照样可用。
+- `rk` and `pa` are AstraLink-specific query parameters. Other clients (Hiddify / sing-box / Clash)
+  ignore unknown parameters, so the line still works as an ordinary hysteria2 share link.
+- With traffic reporting off (panel address left empty) the installer prints the same line minus
+  `rk` / `pa`: a plain hysteria2 share link, so the old paste-to-import flow keeps working.
 
 ---
 
