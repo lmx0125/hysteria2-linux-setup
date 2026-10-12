@@ -15,6 +15,8 @@ TRAFFIC_STATE="${HY_DIR}/traffic-report.state"
 TRAFFIC_STATS_PORT="19999"
 TRAFFIC_INTERVAL="300"
 TRAFFIC_REPORT_SERVICE="hysteria-traffic-report"
+# AstraLink 一键导入文本（开启流量上报时带上 rk / pa，未开启则是一条普通分享链接）
+ASTRA_IMPORT_FILE="${HY_DIR}/astralink-node.txt"
 
 # ===============================
 # 彩色输出函数
@@ -187,6 +189,61 @@ configure_traffic_report() {
 random_secret() {
     local length="${1:-24}"
     openssl rand -hex "$length"
+}
+
+# ===============================
+# URL 编码（密码 / sni / 名称里可能出现特殊字符；jq 缺失时原样输出）
+# ===============================
+url_encode() {
+    if command -v jq >/dev/null 2>&1; then
+        jq -rn --arg v "$1" '$v|@uri'
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# ===============================
+# 公网 IPv4（三种探测方式依次降级，都失败就返回空）
+# ===============================
+public_ipv4() {
+    local ip=""
+    ip=$(curl -s -4 --max-time 5 ifconfig.me 2>/dev/null | tr -d '[:space:]' || true)
+    if [ -z "$ip" ]; then
+        ip=$(curl -s -4 --max-time 5 https://api.ipify.org 2>/dev/null | tr -d '[:space:]' || true)
+    fi
+    if [ -z "$ip" ]; then
+        ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}' || true)
+    fi
+    printf '%s' "${ip:-<你的公网IP>}"
+}
+
+# ===============================
+# 生成 AstraLink 一键导入链接
+#
+#   hysteria2://密码@IP:端口/?insecure=1&sni=域名[&rk=上报密钥&pa=1]#节点名称
+#
+#   · rk / pa 是 AstraLink 专有参数，别的客户端会直接忽略：
+#       rk = 流量上报密钥（落到节点的 params.report_key）
+#       pa = 1 表示面板托管认证（落到 params.panel_auth）
+#     整条链接粘进后台「节点管理 → 新建节点 → 分享链接」，
+#     协议 / 地址 / 端口 / 参数 / 上报密钥 / 托管认证 会一起填好，省掉手工复制密钥与开开关。
+#   · 不开流量上报时不带 rk / pa，就是一条普通 hysteria2 分享链接（老流程照旧可用）。
+# ===============================
+build_import_link() {
+    local host="$1"
+    local link="hysteria2://$(url_encode "$password")@${host}:${port}/?insecure=1&sni=$(url_encode "$domain_name")"
+    if [ -n "$node_key" ]; then
+        link="${link}&rk=$(url_encode "$node_key")&pa=1"
+    fi
+    printf '%s#%s' "$link" "$(url_encode "Hysteria2-${domain_name}")"
+}
+
+# 落一份到文件，方便装完滚屏之后（或重装、换机器时）再 cat 出来导入
+write_import_link() {
+    mkdir -p "$HY_DIR"
+    printf '%s
+' "$1" > "$ASTRA_IMPORT_FILE"
+    chmod 600 "$ASTRA_IMPORT_FILE"
 }
 
 # ===============================
@@ -706,19 +763,41 @@ main() {
     echo "证书路径: /usr/local/hysteria/certs/${domain_name}.crt"
     echo "后台管理：systemctl start/stop hysteria 或 rc-service hysteria start/stop"
 
-    IPV4=$(curl -s -4 ifconfig.me)
+    IPV4=$(public_ipv4)
+    if [ "$IPV4" = "<你的公网IP>" ]; then
+        random_color "⚠️ 没能探测到公网 IPv4，导入链接里的地址是占位符，导入后请改成真实服务器地址"
+    fi
+    import_link=$(build_import_link "$IPV4")
+    if write_import_link "$import_link"; then
+        import_saved="同样内容已写入 ${ASTRA_IMPORT_FILE}，重装或换机器时可以 cat 出来再导入。"
+    else
+        import_saved="（导入文本没能写进 ${ASTRA_IMPORT_FILE}，请先复制上面的链接）"
+    fi
+
+    echo ""
+    echo "==================== AstraLink 一键导入 ===================="
+    echo "把下面这一整行复制到 AstraLink 后台「节点管理 → 新建节点 → 分享链接」，"
+    echo "协议 / 地址 / 端口 / 参数 会自动填好，点「创建节点」即可："
+    echo ""
+    echo "$import_link"
     echo ""
     if [ -n "$traffic_panel" ]; then
-        echo "该节点已改为「面板托管认证」，分享链接由面板按用户生成："
-        echo "  格式：hysteria2://<用户UUID>@${IPV4}:${port}/?insecure=1&sni=${domain_name}#Hysteria2"
+        echo "（链接末尾的 rk= 是流量上报密钥、pa=1 表示面板托管认证，粘贴后这两项"
+        echo "  也会一起填好，不用再手工复制 NODE_KEY；它们都是 AstraLink 专有参数，"
+        echo "  普通客户端会忽略，这条链接同时也是一条能直接用的 hysteria2 分享链接。）"
+        echo "该节点已改为「面板托管认证」，订阅里下发的链接由面板按用户生成："
+        echo "  hysteria2://<用户UUID>@${IPV4}:${port}/?insecure=1&sni=${domain_name}#<节点名>"
         echo "  （每个用户在 AstraLink 里拿到属于自己的 UUID 链接，互不影响）"
     else
-        echo "节点 ： hysteria2://${password}@${IPV4}:${port}/?insecure=1&sni=${domain_name}#Hysteria2"
+        echo "（未开启流量上报：这就是一条普通 hysteria2 分享链接，导入后节点仍按自身密码认证。）"
     fi
+    echo "$import_saved"
+    echo "=========================================================="
     echo ""
 
     if [ -n "$traffic_panel" ]; then
-        node_key=$(grep -m1 '^NODE_KEY=' "$TRAFFIC_CONF" 2>/dev/null | cut -d'"' -f2 || true)
+        # 正常情况下上面的 $node_key 就是刚写进配置的那个；只有它是空的时候才回读配置文件
+        [ -n "$node_key" ] || node_key=$(grep -m1 '^NODE_KEY=' "$TRAFFIC_CONF" 2>/dev/null | cut -d'"' -f2 || true)
         echo "----------------------------------------"
         echo "流量上报与托管认证：已开启（面板 ${panel_scheme}://${panel_host}）"
         echo "认证回调地址：${auth_url}"
@@ -726,9 +805,8 @@ main() {
         echo "服务管理：systemctl status hysteria-traffic-report 或 rc-service hysteria-traffic-report status"
         echo "NODE_KEY：${node_key}"
         echo ""
-        echo "还需两步面板侧配置，否则没人能连上："
-        echo "  1) AstraLink 后台 → 节点管理 → 编辑本节点 → 「流量上报密钥」填上面的 NODE_KEY"
-        echo "  2) 同一表单打开「面板托管认证」开关"
+        echo "面板侧还差一步：把上面的导入链接粘进「节点管理 → 新建节点 → 分享链接」并保存。"
+        echo "  （手动也行：编辑节点 → 「流量上报密钥」填上面的 NODE_KEY，并打开「面板托管认证」开关）"
         echo "之后订阅里下发的就是 hysteria2://<用户UUID>@... 形式的链接，"
         echo "面板按上报的身份把流量累计到每个用户头上。"
         echo "验证联通：curl -s -X POST -d '{\"addr\":\"1.2.3.4:1\",\"auth\":\"测\",\"tx\":0}' '${auth_url}'"
